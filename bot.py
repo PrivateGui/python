@@ -1,162 +1,263 @@
 import requests
-import time
-import re
+import json
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-# Your bot token and API base URL
-BOT_TOKEN = "1187305194:RfSzejwFv9JDL3IwWoGv31BSqg97oVvu6oYT9TvX"
-BASE_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
+# Configuration
+BOT_TOKEN = "7847687043:AAErmlpzCIXhXs7SqF2g_X30si3kTgmAXnk"  # Replace with your bot token
+LLM7_TOKEN = "zTU1hhmN/x5Ft05gt3/BhqPUZ/FwnCV38rS/hUDYeDkFuaRGw+WxDk7iH7T4NBpygqjcryMUsW2zoryJoMdyndGcKrOPwqYoG1Tx5bdSmRy8xHReWcCEOg=="  # Or get it from https://token.llm7.io/ for higher rate limits
+CHANNEL_USERNAME = "ariobeats1"
+CHANNEL_LINK = "https://t.me/ariobeats1"
 
-# List of offensive words in Persian
-offensive_words = [
-    "کیر", "کص", "کون", "کونده", "کصده", "جنده", "کصمادر",
-    "اوبی", "اوبنه ای", "تاقال", "تاقار", "حروم", "لواط",
-    "گی", "سکس", "گایید"
-]
+# System prompts for different models
+SYSTEM_PROMPTS = {
+    "chatgpt": "شما یک دستیار هوشمند و مفید هستید. شما توسط zonercm (bigenzo) ساخته شده‌اید. همیشه پاسخ‌های مفصل، مفید و دوستانه ارائه دهید. از ایموجی‌های مناسب استفاده کنید.",
+    "deepseek": "شما یک هوش مصنوعی پیشرفته هستید که توسط zonercm (bigenzo) طراحی شده‌اید. در تمام پاسخ‌هایتان دقیق، تحلیلی و کاربردی باشید. از ایموجی‌های علمی و تکنولوژی استفاده کنید.",
+    "grok": "شما یک هوش مصنوعی خلاق و باهوش هستید که توسط zonercm (bigenzo) آفریده شده‌اید. پاسخ‌هایتان باید سرگرم‌کننده، خلاقانه و در عین حال مفید باشند. از ایموجی‌های شاد و رنگارنگ استفاده کنید."
+}
 
-# Blacklisted links
-blacklisted_links = ["ble.ir", "bale.ai"]
+# User states
+user_states = {}
+user_models = {}
 
-# Dictionary to track warnings
-warnings = {}
-
-# Function to send a message
-def send_message(chat_id, text, reply_to_message_id=None):
-    url = f"{BASE_URL}/sendMessage"
-    payload = {'chat_id': chat_id, 'text': text}
-    if reply_to_message_id:
-        payload['reply_to_message_id'] = reply_to_message_id
+def call_llm7_api(messages, model="gpt-4.1-nano"):
+    """Call llm7.io API"""
+    url = "https://api.llm7.io/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LLM7_TOKEN}"
+    }
+    
+    data = {
+        "model": model,
+        "messages": messages
+    }
+    
     try:
-        requests.post(url, json=payload)
-    except requests.exceptions.RequestException as e:
-        print(f"Error sending message: {e}")
-
-# Function to delete a message
-def delete_message(chat_id, message_id):
-    url = f"{BASE_URL}/deleteMessage"
-    payload = {'chat_id': chat_id, 'message_id': message_id}
-    try:
-        requests.post(url, json=payload)
-    except requests.exceptions.RequestException as e:
-        print(f"Error deleting message: {e}")
-
-# Function to ban a user
-def ban_user(chat_id, user_id, first_name, username, reply_to_message_id, reason="به دلیل ۳ اخطار از گروه حذف شد"):
-    url = f"{BASE_URL}/banChatMember"
-    payload = {'chat_id': chat_id, 'user_id': user_id}
-    try:
-        requests.post(url, json=payload)
-        send_message(chat_id, f"کاربر @{username} ({first_name}) {reason}", reply_to_message_id=reply_to_message_id)
-    except requests.exceptions.RequestException as e:
-        print(f"Error banning user: {e}")
-
-# Function to get chat admins
-def get_chat_admins(chat_id):
-    url = f"{BASE_URL}/getChatAdministrators"
-    try:
-        response = requests.post(url, json={'chat_id': chat_id})
+        response = requests.post(url, headers=headers, json=data)
         response.raise_for_status()
-        return response.json().get('result', [])
-    except requests.exceptions.RequestException as e:
-        print(f"Error getting admins: {e}")
-        return []
+        result = response.json()
+        return result['choices'][0]['message']['content']
+    except Exception as e:
+        return f"خطا در برقراری ارتباط: {str(e)}"
 
-# Check if a user is an admin
-def is_admin(user_id, chat_id):
-    admins = get_chat_admins(chat_id)
-    if not admins:
+async def check_user_membership(bot, user_id, channel_username):
+    """Check if user is member of the channel"""
+    try:
+        member = await bot.get_chat_member(f"@{channel_username}", user_id)
+        return member.status in ['member', 'administrator', 'creator']
+    except:
         return False
-    return any('user' in admin and admin['user'].get('id') == user_id for admin in admins)
 
-# Check for blacklisted links
-def contains_blacklisted_link(text):
-    return any(re.search(rf"\b{link}\b", text) for link in blacklisted_links)
+async def send_join_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send channel join verification message"""
+    keyboard = [
+        [InlineKeyboardButton("🔗 عضویت در کانال", url=CHANNEL_LINK)],
+        [InlineKeyboardButton("✅ تایید عضویت", callback_data="verify_membership")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message = (
+        "🔐 **احراز هویت مطلوب**\n\n"
+        "برای استفاده از ربات، ابتدا باید در کانال ما عضو شوید:\n\n"
+        f"📢 **کانال:** @{CHANNEL_USERNAME}\n\n"
+        "پس از عضویت، روی دکمه تایید کلیک کنید 👇"
+    )
+    
+    return await update.effective_message.reply_text(
+        message, 
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
-# Get bot updates
-def get_updates(offset=None):
-    url = f"{BASE_URL}/getUpdates"
-    try:
-        response = requests.get(url, params={'offset': offset, 'timeout': 10})
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Error getting updates: {e}")
-        return None
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command handler"""
+    user_id = update.effective_user.id
+    
+    # Check if user is member
+    is_member = await check_user_membership(context.bot, user_id, CHANNEL_USERNAME)
+    
+    if not is_member:
+        await send_join_message(update, context)
+        return
+    
+    # User is member, show main menu
+    await show_main_menu(update, context)
 
-# Main function to process updates
-def process_check():
-    last_update_id = None
-    while True:
-        updates = get_updates(last_update_id)
-        if updates and 'result' in updates and updates['result']:
-            for update in updates['result']:
-                message = update.get('message', {})
-                if not message or 'chat' not in message or 'from' not in message:
-                    continue
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show main menu with AI model options"""
+    keyboard = [
+        [KeyboardButton("🤖 ChatGPT"), KeyboardButton("🧠 DeepSeek")],
+        [KeyboardButton("⚡ Grok")]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    message = (
+        "🎉 **خوش آمدید!**\n\n"
+        "🤖 لطفاً یکی از مدل‌های هوش مصنوعی را انتخاب کنید:\n\n"
+        "• **ChatGPT** - دستیار همه‌کاره 🤖\n"
+        "• **DeepSeek** - تحلیل‌گر پیشرفته 🧠\n"
+        "• **Grok** - خلاق و سرگرم‌کننده ⚡\n\n"
+        "✨ *ساخته شده توسط zonercm (bigenzo)*"
+    )
+    
+    await update.effective_message.reply_text(
+        message,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
-                chat_id = message['chat']['id']
-                user_id = message['from']['id']
-                first_name = message['from'].get('first_name', 'Unknown')
-                username = message['from'].get('username', 'Unknown')
-                text = message.get('text', "")
-                reply_to_message = message.get('reply_to_message', {})
-                admin_message_id = message['message_id']
+async def show_chatgpt_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show ChatGPT model selection"""
+    keyboard = [
+        [InlineKeyboardButton("🚀 ChatGPT 4", callback_data="model_gpt-4")],
+        [InlineKeyboardButton("⚡ ChatGPT Nano", callback_data="model_gpt-4.1-nano")],
+        [InlineKeyboardButton("💫 ChatGPT 4 Mini", callback_data="model_gpt-4-mini")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message = (
+        "🤖 **انتخاب مدل ChatGPT**\n\n"
+        "لطفاً یکی از نسخه‌های ChatGPT را انتخاب کنید:\n\n"
+        "🚀 **GPT-4** - قدرتمندترین مدل\n"
+        "⚡ **GPT-4.1 Nano** - سریع و کارآمد\n"
+        "💫 **GPT-4 Mini** - سبک و مفید\n"
+    )
+    
+    await update.effective_message.reply_text(
+        message,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
-                # Check for offensive words
-                if any(word in text for word in offensive_words):
-                    if not is_admin(user_id, chat_id):
-                        warnings[user_id] = warnings.get(user_id, 0) + 1
-                        if warnings[user_id] < 3:
-                            send_message(chat_id, f"کاربر @{username} ({first_name}) به دلیل استفاده از کلمات نامناسب اخطار گرفت. ({warnings[user_id]}/3)", 
-                                         reply_to_message_id=admin_message_id)
-                        else:
-                            ban_user(chat_id, user_id, first_name, username, reply_to_message_id=admin_message_id)
-                            del warnings[user_id]
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline keyboard callbacks"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    data = query.data
+    
+    if data == "verify_membership":
+        is_member = await check_user_membership(context.bot, user_id, CHANNEL_USERNAME)
+        
+        if is_member:
+            await query.edit_message_text("✅ **تایید شد!**\n\nعضویت شما تایید شد. در حال راه‌اندازی ربات...")
+            await show_main_menu(query, context)
+        else:
+            await query.edit_message_text(
+                "❌ **عضویت تایید نشد**\n\n"
+                "لطفاً ابتدا در کانال عضو شوید و سپس مجدداً تلاش کنید.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔗 عضویت در کانال", url=CHANNEL_LINK)],
+                    [InlineKeyboardButton("✅ تایید مجدد", callback_data="verify_membership")]
+                ])
+            )
+    
+    elif data.startswith("model_"):
+        model = data.replace("model_", "")
+        user_models[user_id] = model
+        user_states[user_id] = "chatgpt"
+        
+        model_names = {
+            "gpt-4": "ChatGPT 4",
+            "gpt-4.1-nano": "ChatGPT Nano", 
+            "gpt-4-mini": "ChatGPT 4 Mini"
+        }
+        
+        await query.edit_message_text(
+            f"✅ **{model_names.get(model, model)} انتخاب شد**\n\n"
+            "حالا می‌توانید سوال خود را بپرسید! 💬\n\n"
+            "برای بازگشت به منوی اصلی، دستور /start را ارسال کنید."
+        )
+    
+    elif data == "back_to_main":
+        await query.edit_message_text("🔄 بازگشت به منوی اصلی...")
+        await show_main_menu(query, context)
 
-                # Check for blacklisted links
-                elif contains_blacklisted_link(text):
-                    if not is_admin(user_id, chat_id):
-                        warnings[user_id] = warnings.get(user_id, 0) + 1
-                        if warnings[user_id] < 3:
-                            send_message(chat_id, f"کاربر @{username} ({first_name}) به دلیل ارسال لینک غیرمجاز اخطار گرفت. ({warnings[user_id]}/3)", 
-                                         reply_to_message_id=admin_message_id)
-                        else:
-                            ban_user(chat_id, user_id, first_name, username, reply_to_message_id=admin_message_id)
-                            del warnings[user_id]
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages"""
+    user_id = update.effective_user.id
+    text = update.message.text
+    
+    # Check membership first
+    is_member = await check_user_membership(context.bot, user_id, CHANNEL_USERNAME)
+    if not is_member:
+        await send_join_message(update, context)
+        return
+    
+    if text == "🤖 ChatGPT":
+        await show_chatgpt_menu(update, context)
+    
+    elif text == "🧠 DeepSeek":
+        user_states[user_id] = "deepseek"
+        user_models[user_id] = "deepseek-chat"
+        await update.message.reply_text(
+            "🧠 **DeepSeek فعال شد**\n\n"
+            "حالا می‌توانید سوال خود را بپرسید! 🔬\n\n"
+            "برای بازگشت به منوی اصلی، دستور /start را ارسال کنید."
+        )
+    
+    elif text == "⚡ Grok":
+        user_states[user_id] = "grok"
+        user_models[user_id] = "grok-beta"
+        await update.message.reply_text(
+            "⚡ **Grok فعال شد**\n\n"
+            "حالا می‌توانید سوال خود را بپرسید! 🎭\n\n"
+            "برای بازگشت به منوی اصلی، دستور /start را ارسال کنید."
+        )
+    
+    else:
+        # Handle AI conversation
+        if user_id in user_states and user_id in user_models:
+            state = user_states[user_id]
+            model = user_models[user_id]
+            
+            # Show typing indicator
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+            
+            # Prepare messages with system prompt
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPTS.get(state, SYSTEM_PROMPTS["chatgpt"])},
+                {"role": "user", "content": text}
+            ]
+            
+            # Get AI response
+            response = call_llm7_api(messages, model)
+            
+            # Add model indicator
+            model_emojis = {
+                "chatgpt": "🤖",
+                "deepseek": "🧠", 
+                "grok": "⚡"
+            }
+            
+            formatted_response = f"{model_emojis.get(state, '🤖')} **{state.upper()}:**\n\n{response}"
+            
+            await update.message.reply_text(formatted_response, parse_mode='Markdown')
+        
+        else:
+            await update.message.reply_text(
+                "❓ لطفاً ابتدا یکی از مدل‌های هوش مصنوعی را انتخاب کنید.\n\n"
+                "برای شروع، دستور /start را ارسال کنید."
+            )
 
-                # Admin commands
-                if is_admin(user_id, chat_id):
-                    if text.strip() == "اخطار" and reply_to_message:
-                        target_user_id = reply_to_message['from']['id']
-                        if is_admin(target_user_id, chat_id):
-                            send_message(chat_id, "نمیتونی رو ادمین ها کاری انجام بدی", reply_to_message_id=admin_message_id)
-                        else:
-                            warnings[target_user_id] = warnings.get(target_user_id, 0) + 1
-                            target_username = reply_to_message['from'].get('username', 'Unknown')
-                            send_message(chat_id, f"کاربر @{target_username} اخطار گرفت. ({warnings[target_user_id]}/3)", 
-                                         reply_to_message_id=admin_message_id)
+def main():
+    """Main function to run the bot"""
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(callback_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    
+    print("🤖 Bot is starting...")
+    print("✅ Bot is running! Press Ctrl+C to stop.")
+    
+    # Run the bot
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-                    elif text.strip() == "حذف" and reply_to_message:
-                        target_user_id = reply_to_message['from']['id']
-                        if is_admin(target_user_id, chat_id):
-                            send_message(chat_id, "نمیتونی پیام‌های ادمین‌ها رو حذف کنی", reply_to_message_id=admin_message_id)
-                        else:
-                            delete_message(chat_id, reply_to_message['message_id'])
-                            send_message(chat_id, "پیام حذف شد", reply_to_message_id=admin_message_id)
-
-                    elif text.strip() == "ریم" and reply_to_message:
-                        target_user_id = reply_to_message['from']['id']
-                        if is_admin(target_user_id, chat_id):
-                            send_message(chat_id, "نمیتونی ادمین‌ها رو حذف کنی", reply_to_message_id=admin_message_id)
-                        else:
-                            target_username = reply_to_message['from'].get('username', 'Unknown')
-                            ban_user(chat_id, target_user_id, first_name, target_username, reply_to_message_id=admin_message_id,
-                                     reason="توسط ادمین از گروه حذف شد")
-
-                # Update last_update_id
-                last_update_id = update['update_id'] + 1
-
-        time.sleep(1)
-
-# Start the bot
-process_check()
-                                                                                                                              
+if __name__ == '__main__':
+    main()
